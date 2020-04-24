@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::msg::{HandleMsg, InitMsg, QueryMsg};
-use cosmwasm::errors::{contract_err, unauthorized, Result};
+use cosmwasm::errors::{Error, contract_err, unauthorized, Result};
 use cosmwasm::traits::{Api, Extern, Storage};
 use cosmwasm::types::{log, HumanAddr, CanonicalAddr, Coin, CosmosMsg, Env, Response};
 use cw_storage::{singleton, Singleton};
@@ -42,7 +42,7 @@ pub fn init<S: Storage, A: Api>(
     let state = State {
         region: msg.region,
         beneficiary: deps.api.canonical_address(&msg.beneficiary)?,
-        oracle: deps.api.canonical_address(&msg.beneficiary)?,
+        oracle: deps.api.canonical_address(&msg.oracle)?,
         ecostate: msg.ecostate,
         total_tokens: msg.total_tokens,
         released_tokens: 0,
@@ -79,14 +79,31 @@ fn try_payout<S: Storage, A: Api>(
     env: Env,
     ecostate: i64,
 ) -> Result<Response> {
-    let state: State = config(&mut deps.storage).load()?;
+    let state: &mut State = &mut config(&mut deps.storage).load()?;
+    let available = state.total_tokens - state.released_tokens;
     if state.oracle != env.message.signer {
         unauthorized()
+    } else if state.is_locked {
+        contract_err("contract is locked. no payout possible")
+    } else if available <= 0 {
+        contract_err("No more funds available")
     } else {
         let tokens = calculate_payout(state.ecostate, ecostate);
         if tokens != 0 {
-            let amount = vec![Coin {amount: tokens.to_string(), denom: String::from("utree")}];
-            send_tokens(&deps.api, &state.owner, &state.beneficiary, amount, "payout")
+            state.ecostate = ecostate;
+            let amount: i64;
+            if tokens > available {
+                amount = available;
+                state.released_tokens = state.total_tokens;
+            } else {
+                amount = tokens;
+                state.released_tokens = state.released_tokens + tokens;
+            }
+
+            config(&mut deps.storage).save(state)?;
+            
+            let coins = vec![Coin {amount: amount.to_string(), denom: String::from("utree")}];
+            send_tokens(&deps.api, &env.contract.address, &state.beneficiary, coins, "payout")
         } else {
             contract_err("Not enough improvement for payout")
         }
@@ -264,244 +281,8 @@ fn send_tokens<A: Api>(
 }
 
 pub fn query<S: Storage, A: Api>(_deps: &Extern<S, A>, msg: QueryMsg) -> Result<Vec<u8>> {
+    
+    Err(Error::NotFound {kind: "not implemented"})
     // this always returns error
-    match msg {}
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use cosmwasm::errors::Error;
-    use cosmwasm::mock::{dependencies, mock_env};
-    use cosmwasm::traits::Api;
-    use cosmwasm::types::{coin, HumanAddr};
-
-    fn init_msg_expire_by_height(height: i64) -> InitMsg {
-        InitMsg {
-            arbiter: HumanAddr::from("verifies"),
-            recipient: HumanAddr::from("benefits"),
-            end_height: Some(height),
-            end_time: None,
-        }
-    }
-
-    fn mock_env_height<A: Api>(
-        api: &A,
-        signer: &str,
-        sent: &[Coin],
-        balance: &[Coin],
-        height: i64,
-        time: i64,
-    ) -> Env {
-        let mut env = mock_env(api, signer, sent, balance);
-        env.block.height = height;
-        env.block.time = time;
-        env
-    }
-
-    #[test]
-    fn proper_initialization() {
-        let mut deps = dependencies(20);
-
-        let msg = init_msg_expire_by_height(1000);
-        let env = mock_env_height(&deps.api, "creator", &coin("1000", "earth"), &[], 876, 0);
-        let res = init(&mut deps, env, msg).unwrap();
-        assert_eq!(0, res.messages.len());
-
-        // it worked, let's query the state
-        let state = config(&mut deps.storage).load().unwrap();
-        assert_eq!(
-            state,
-            State {
-                arbiter: deps
-                    .api
-                    .canonical_address(&HumanAddr::from("verifies"))
-                    .unwrap(),
-                recipient: deps
-                    .api
-                    .canonical_address(&HumanAddr::from("benefits"))
-                    .unwrap(),
-                source: deps
-                    .api
-                    .canonical_address(&HumanAddr::from("creator"))
-                    .unwrap(),
-                end_height: Some(1000),
-                end_time: None,
-            }
-        );
-    }
-
-    #[test]
-    fn cannot_initialize_expired() {
-        let mut deps = dependencies(20);
-
-        let msg = init_msg_expire_by_height(1000);
-        let env = mock_env_height(&deps.api, "creator", &coin("1000", "earth"), &[], 1001, 0);
-        let res = init(&mut deps, env, msg);
-        assert!(res.is_err());
-        if let Err(Error::ContractErr { msg, .. }) = res {
-            assert_eq!(msg, "creating expired escrow".to_string());
-        } else {
-            assert!(false, "wrong error type");
-        }
-    }
-
-    #[test]
-    fn handle_approve() {
-        let mut deps = dependencies(20);
-
-        // initialize the store
-        let msg = init_msg_expire_by_height(1000);
-        let env = mock_env_height(&deps.api, "creator", &coin("1000", "earth"), &[], 876, 0);
-        let init_res = init(&mut deps, env, msg).unwrap();
-        assert_eq!(0, init_res.messages.len());
-
-        // beneficiary cannot release it
-        let msg = HandleMsg::Approve { quantity: None };
-        let env = mock_env_height(
-            &deps.api,
-            "beneficiary",
-            &coin("0", "earth"),
-            &coin("1000", "earth"),
-            900,
-            0,
-        );
-        let handle_res = handle(&mut deps, env, msg.clone());
-        match handle_res {
-            Ok(_) => panic!("expected error"),
-            Err(Error::Unauthorized { .. }) => {}
-            Err(e) => panic!("unexpected error: {:?}", e),
-        }
-
-        // verifier cannot release it when expired
-        let env = mock_env_height(
-            &deps.api,
-            "verifies",
-            &coin("0", "earth"),
-            &coin("1000", "earth"),
-            1100,
-            0,
-        );
-        let handle_res = handle(&mut deps, env, msg.clone());
-        match handle_res {
-            Ok(_) => panic!("expected error"),
-            Err(Error::ContractErr { msg, .. }) => assert_eq!(msg, "escrow expired".to_string()),
-            Err(e) => panic!("unexpected error: {:?}", e),
-        }
-
-        // complete release by verfier, before expiration
-        let env = mock_env_height(
-            &deps.api,
-            "verifies",
-            &coin("0", "earth"),
-            &coin("1000", "earth"),
-            999,
-            0,
-        );
-        let handle_res = handle(&mut deps, env, msg.clone()).unwrap();
-        assert_eq!(1, handle_res.messages.len());
-        let msg = handle_res.messages.get(0).expect("no message");
-        assert_eq!(
-            msg,
-            &CosmosMsg::Send {
-                from_address: HumanAddr::from("cosmos2contract"),
-                to_address: HumanAddr::from("benefits"),
-                amount: coin("1000", "earth"),
-            }
-        );
-
-        // partial release by verfier, before expiration
-        let partial_msg = HandleMsg::Approve {
-            quantity: Some(coin("500", "earth")),
-        };
-        let env = mock_env_height(
-            &deps.api,
-            "verifies",
-            &coin("0", "earth"),
-            &coin("1000", "earth"),
-            999,
-            0,
-        );
-        let handle_res = handle(&mut deps, env, partial_msg).unwrap();
-        assert_eq!(1, handle_res.messages.len());
-        let msg = handle_res.messages.get(0).expect("no message");
-        assert_eq!(
-            msg,
-            &CosmosMsg::Send {
-                from_address: HumanAddr::from("cosmos2contract"),
-                to_address: HumanAddr::from("benefits"),
-                amount: coin("500", "earth"),
-            }
-        );
-    }
-
-    #[test]
-    fn handle_refund() {
-        let mut deps = dependencies(20);
-
-        // initialize the store
-        let msg = init_msg_expire_by_height(1000);
-        let env = mock_env_height(&deps.api, "creator", &coin("1000", "earth"), &[], 876, 0);
-        let init_res = init(&mut deps, env, msg).unwrap();
-        assert_eq!(0, init_res.messages.len());
-
-        // cannot release when unexpired (height < end_height)
-        let msg = HandleMsg::Refund {};
-        let env = mock_env_height(
-            &deps.api,
-            "anybody",
-            &coin("0", "earth"),
-            &coin("1000", "earth"),
-            800,
-            0,
-        );
-        let handle_res = handle(&mut deps, env, msg.clone());
-        match handle_res {
-            Ok(_) => panic!("expected error"),
-            Err(Error::ContractErr { msg, .. }) => {
-                assert_eq!(msg, "escrow not yet expired".to_string())
-            }
-            Err(e) => panic!("unexpected error: {:?}", e),
-        }
-
-        // cannot release when unexpired (height == end_height)
-        let msg = HandleMsg::Refund {};
-        let env = mock_env_height(
-            &deps.api,
-            "anybody",
-            &coin("0", "earth"),
-            &coin("1000", "earth"),
-            1000,
-            0,
-        );
-        let handle_res = handle(&mut deps, env, msg.clone());
-        match handle_res {
-            Ok(_) => panic!("expected error"),
-            Err(Error::ContractErr { msg, .. }) => {
-                assert_eq!(msg, "escrow not yet expired".to_string())
-            }
-            Err(e) => panic!("unexpected error: {:?}", e),
-        }
-
-        // anyone can release after expiration
-        let env = mock_env_height(
-            &deps.api,
-            "anybody",
-            &coin("0", "earth"),
-            &coin("1000", "earth"),
-            1001,
-            0,
-        );
-        let handle_res = handle(&mut deps, env, msg.clone()).unwrap();
-        assert_eq!(1, handle_res.messages.len());
-        let msg = handle_res.messages.get(0).expect("no message");
-        assert_eq!(
-            msg,
-            &CosmosMsg::Send {
-                from_address: HumanAddr::from("cosmos2contract"),
-                to_address: HumanAddr::from("creator"),
-                amount: coin("1000", "earth"),
-            }
-        );
-    }
+    //match msg {}
 }
